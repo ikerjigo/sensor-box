@@ -1,7 +1,7 @@
 #include <Arduino.h>
 
 void setup() {
-  neopixelWrite(48, 0, 0, 0);
+  neopixelWrite(48, 10, 10, 10);
 }
 
 void loop() {
