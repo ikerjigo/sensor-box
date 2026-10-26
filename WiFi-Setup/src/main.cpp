@@ -1,177 +1,210 @@
+/*
+ ============================================================================
+  ESP32-S3 · Portal de configuración Wi-Fi + Dashboard web
+ ----------------------------------------------------------------------------
+  Funcionamiento general:
+   1. Al arrancar intenta conectarse a la red Wi-Fi guardada en la flash.
+   2. Si no hay red guardada (o falla), crea su propia red "ESP32-Setup"
+    (portal) para que el usuario elija su Wi-Fi y escriba la contraseña.
+   3. Cuando hay conexión, sirve un dashboard con datos de red y hardware.
+   4. Un LED RGB indica el estado en todo momento.
 
-#include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <Preferences.h>
-#include <esp_system.h>
+  Librerías necesarias: ArduinoJson v7 (Gestor de librerías).
+ ============================================================================
+*/
 
-// --------------------------------------------------
-// Configuration
-// --------------------------------------------------
+// ============================================================================
+//  SECCIÓN 1 · INCLUDES
+// ============================================================================
 
+
+
+#include <Arduino.h>     // Funciones base: millis(), delay(), Serial, String, neopixelWrite(), para lo necesario de un microcontrolador
+#include <WiFi.h>        // Conexión Wi-Fi (modo cliente) y punto de acceso (AP)
+#include <WebServer.h>   // Servidor HTTP sencillo para el ESP32
+#include <Preferences.h> // Guardar datos en la memoria flash (NVS); sobreviven a reinicios
+#include <ArduinoJson.h> // Construir JSON sin concatenar strings a mano (escapa solo)
+
+
+
+// ============================================================================
+//  SECCIÓN 2 · CONFIGURACIÓN (constantes que puedes ajustar)
+// ============================================================================
+
+
+
+// Pin del LED RGB integrado (en muchas placas ESP32-S3 es el GPIO 48)
 #define RGB_LED_PIN 48
 
+// Nombre de la red Wi-Fi que crea el ESP32 en modo configuración
 static const char *AP_SSID = "ESP32-Setup";
+
+// Contraseña de esa red (mínimo 8 caracteres)
 static const char *AP_PASSWORD = "esp32-config";
 
+// Tiempo máximo (ms) para intentar conectar a una red antes de darse por vencido
 static const uint32_t CONNECT_TIMEOUT_MS = 20000;
+
+// Tiempo (ms) que se espera tras conectar antes de apagar el AP de configuración
+// (da tiempo al navegador del usuario a mostrar la IP obtenida)
 static const uint32_t AP_SHUTDOWN_DELAY_MS = 10000;
+
+// Cada cuántos ms cambia la fase del parpadeo del LED
 static const uint32_t LED_INTERVAL_MS = 500;
 
-// --------------------------------------------------
-// Globals
-// --------------------------------------------------
 
+
+// ============================================================================
+//  SECCIÓN 3 · VARIABLES GLOBALES Y ESTADOS
+// ============================================================================
+
+
+
+// Servidor HTTP escuchando en el puerto 80
 WebServer server(80);
+
+// Objeto para leer/escribir en la memoria flash (credenciales Wi-Fi)
 Preferences preferences;
 
-enum ConnectionState {
-    STATE_IDLE,
-    STATE_CONNECTING,
-    STATE_CONNECTED,
-    STATE_FAILED
+// Estados posibles de la conexión Wi-Fi (máquina de estados simple)
+enum ConnectionState
+{
+    STATE_IDLE,       // Sin hacer nada (portal esperando al usuario)
+    STATE_CONNECTING, // Intentando conectar a una red
+    STATE_CONNECTED,  // Conectado correctamente
+    STATE_FAILED      // La conexión falló o expiró el tiempo
 };
 
+// Estado actual de la conexión
 ConnectionState connectionState = STATE_IDLE;
 
+// Nombres de los estados en texto, en el mismo orden que el enum.
+// Se usan para enviar el estado al navegador en formato JSON.
+const char *STATE_NAMES[] = {"idle", "connecting", "connected", "failed"};
+
+// SSID que el usuario envió desde el formulario (pendiente de verificar)
 String pendingSSID;
+
+// Contraseña enviada desde el formulario (solo se guarda si la conexión funciona)
 String pendingPassword;
 
+// Momento (millis) en que empezó el intento de conexión actual
 uint32_t connectionStartedAt = 0;
+
+// Momento (millis) en que se logró conectar
 uint32_t connectedAt = 0;
+
+// Última vez (millis) que cambió la fase del parpadeo del LED
 uint32_t lastLedUpdate = 0;
 
+// true mientras el AP de configuración (portal) está activo
 bool portalActive = false;
-bool credentialsSaved = false;
+
+// Fase actual del parpadeo: true = encendido, false = apagado
 bool ledOn = false;
 
-// --------------------------------------------------
-// RGB LED status
-// --------------------------------------------------
 
 
-void updateStatusLED() {
-    uint32_t now = millis();
+// ============================================================================
+//  SECCIÓN 4 · LED RGB DE ESTADO
+// ============================================================================
 
-    if (now - lastLedUpdate >= LED_INTERVAL_MS) {
-        lastLedUpdate = now;
-        ledOn = !ledOn;
+
+
+// Actualiza el LED según el estado. Se llama continuamente desde loop().
+// Colores (valores bajos, 15 de 255, para que no deslumbre):
+//   Azul fijo          -> conectado
+//   Amarillo parpadea  -> conectando
+//   Rojo fijo          -> conexión fallida
+//   Rojo parpadea      -> portal de configuración activo
+//   Apagado            -> cualquier otro caso
+void updateStatusLED()
+{
+    uint32_t now = millis(); // Hora actual en ms desde el arranque
+
+    // Cada LED_INTERVAL_MS invierte la fase del parpadeo (sin usar delay())
+    if (now - lastLedUpdate >= LED_INTERVAL_MS)
+    {
+        lastLedUpdate = now; // Anota cuándo se hizo el último cambio
+        ledOn = !ledOn;      // Alterna encendido/apagado
     }
 
-    if (connectionState == STATE_CONNECTED) {
-        // Dim blue: connected
-        neopixelWrite(RGB_LED_PIN, 0, 0, 15);
-    }
-    else if (connectionState == STATE_CONNECTING) {
-        // Dim flashing yellow: connecting
-        if (ledOn) {
-            neopixelWrite(RGB_LED_PIN, 15, 6, 0);
-        } else {
-            neopixelWrite(RGB_LED_PIN, 0, 0, 0);
+    uint8_t r = 0, g = 0, b = 0; // Color por defecto: apagado
+
+    if (connectionState == STATE_CONNECTED)
+    {
+        b = 15;
+    } // Azul fijo
+    else if (connectionState == STATE_CONNECTING)
+    {
+        if (ledOn)
+        {
+            r = 15;
+            g = 6;
         }
-    }
-    else if (portalActive && connectionState == STATE_IDLE) {
-        // Dim flashing red: setup AP active
-        if (ledOn) {
-            neopixelWrite(RGB_LED_PIN, 15, 0, 0);
-        } else {
-            neopixelWrite(RGB_LED_PIN, 0, 0, 0);
-        }
-    }
-    else if (connectionState == STATE_FAILED) {
-        // Dim red: connection failed
-        neopixelWrite(RGB_LED_PIN, 15, 0, 0);
-    }
-    else {
-        neopixelWrite(RGB_LED_PIN, 0, 0, 0);
-    }
+    } // Amarillo parpadeante
+    else if (connectionState == STATE_FAILED)
+    {
+        r = 15;
+    } // Rojo fijo
+    else if (portalActive)
+    {
+        if (ledOn)
+            r = 15;
+    } // Rojo parpadeante
+
+    neopixelWrite(RGB_LED_PIN, r, g, b); // Escribe el color calculado en el LED
 }
 
 
-// --------------------------------------------------
-// Helpers
-// --------------------------------------------------
 
-String connectionStateName() {
-    switch (connectionState) {
-        case STATE_IDLE:
-            return "idle";
-        case STATE_CONNECTING:
-            return "connecting";
-        case STATE_CONNECTED:
-            return "connected";
-        case STATE_FAILED:
-            return "failed";
-        default:
-            return "unknown";
-    }
+// ============================================================================
+//  SECCIÓN 5 · FUNCIONES AUXILIARES
+// ============================================================================
+
+
+
+// Convierte el tiempo encendido (millis) a texto con formato "Xd, HH:MM:SS"
+String formatUptime()
+{
+    uint32_t s = millis() / 1000; // Milisegundos -> segundos totales
+    char buf[48];                 // Buffer donde se escribe el texto
+
+    // %lu = unsigned long, %02lu = al menos 2 dígitos rellenando con ceros.
+    // Se calculan días, horas (0-23), minutos (0-59) y segundos (0-59).
+    snprintf(buf, sizeof(buf), "%lud, %02lu:%02lu:%02lu",
+             (unsigned long)(s / 86400),
+             (unsigned long)((s / 3600) % 24),
+             (unsigned long)((s / 60) % 60),
+             (unsigned long)(s % 60));
+
+    return buf; // Se convierte automáticamente a String
 }
 
-String jsonEscape(const String &input) {
-    String output;
-    output.reserve(input.length() + 8);
-
-    for (size_t i = 0; i < input.length(); i++) {
-        char c = input[i];
-
-        switch (c) {
-            case '"':
-                output += "\\\"";
-                break;
-            case '\\':
-                output += "\\\\";
-                break;
-            case '\n':
-                output += "\\n";
-                break;
-            case '\r':
-                output += "\\r";
-                break;
-            case '\t':
-                output += "\\t";
-                break;
-            default:
-                if ((uint8_t)c >= 0x20) {
-                    output += c;
-                }
-                break;
-        }
-    }
-
-    return output;
+// Serializa un documento JSON y lo envía al navegador como respuesta HTTP
+void sendJson(JsonDocument &doc, int code = 200)
+{
+    String out;                                 // Texto JSON resultante
+    serializeJson(doc, out);                    // Convierte el documento a texto
+    server.send(code, "application/json", out); // Responde con el código y tipo adecuados
 }
 
-String formatUptime() {
-    uint32_t seconds = millis() / 1000;
+// ============================================================================
+//  SECCIÓN 6 · PÁGINAS HTML
+//  (El contenido entre R"rawliteral( ... )rawliteral" es HTML/CSS/JS que se
+//   envía tal cual al navegador. Los literales "crudos" permiten escribir
+//   varias líneas y comillas sin escapar nada.)
+// ============================================================================
 
-    uint32_t days = seconds / 86400;
-    seconds %= 86400;
-
-    uint32_t hours = seconds / 3600;
-    seconds %= 3600;
-
-    uint32_t minutes = seconds / 60;
-    seconds %= 60;
-
-    char buffer[48];
-
-    snprintf(
-        buffer,
-        sizeof(buffer),
-        "%lu days, %02lu:%02lu:%02lu",
-        (unsigned long)days,
-        (unsigned long)hours,
-        (unsigned long)minutes,
-        (unsigned long)seconds
-    );
-
-    return String(buffer);
-}
-
-String makePage(const String &title, const String &content) {
+// Construye la página completa: cabecera + estilos + script de tema + contenido + pie.
+//   title   -> texto de la pestaña del navegador
+//   content -> HTML específico de cada página (setup o dashboard)
+String makePage(const String &title, const String &content)
+{
     String html;
-    html.reserve(7000);
+    html.reserve(7000); // Reserva memoria de antemano (evita fragmentación)
 
+    // Parte inicial: doctype, <head> y apertura de <title>
     html += R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -180,8 +213,9 @@ String makePage(const String &title, const String &content) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>)rawliteral";
 
-    html += title;
+    html += title; // Inserta el título de la pestaña
 
+    // Estilos CSS (tema claro/oscuro), script de cambio de tema y cabecera de la página
     html += R"rawliteral(</title>
 <style>
 :root {
@@ -304,8 +338,9 @@ document.addEventListener('DOMContentLoaded', applyTheme);
 </header>
 )rawliteral";
 
-    html += content;
+    html += content; // Inserta el contenido propio de cada página
 
+    // Pie de página y cierre del HTML
     html += R"rawliteral(
 <p class="muted" style="text-align:center;font-size:.85rem">
 ESP32-S3 · Local web interface
@@ -315,14 +350,13 @@ ESP32-S3 · Local web interface
 </html>
 )rawliteral";
 
-    return html;
+    return html; // Devuelve la página completa
 }
 
-// --------------------------------------------------
-// Setup page
-// --------------------------------------------------
-
-String makeSetupPage() {
+// Página de configuración Wi-Fi: escanear redes, elegir una, escribir la
+// contraseña y conectar. Usa los endpoints /networks, /connect y /status.
+String makeSetupPage()
+{
     String content = R"rawliteral(
 <section class="card">
     <h2>Wi-Fi configuration</h2>
@@ -459,14 +493,13 @@ scanNetworks();
 </script>
 )rawliteral";
 
-    return makePage("ESP32 Wi-Fi Setup", content);
+    return makePage("ESP32 Wi-Fi Setup", content); // Envuelve el contenido en la página base
 }
 
-// --------------------------------------------------
-// Dashboard page
-// --------------------------------------------------
-
-String makeDashboard() {
+// Página del dashboard: muestra datos de red, hardware y sistema, y permite
+// olvidar la Wi-Fi. Usa los endpoints /info (cada 3 s) y /forget.
+String makeDashboard()
+{
     String content = R"rawliteral(
 <section class="card">
     <h2>Network</h2>
@@ -595,294 +628,265 @@ setInterval(refreshInfo, 3000);
 </script>
 )rawliteral";
 
-    return makePage("ESP32 Dashboard", content);
+    return makePage("ESP32 Dashboard", content); // Envuelve el contenido en la página base
 }
 
-// --------------------------------------------------
-// HTTP handlers
-// --------------------------------------------------
+// ============================================================================
+//  SECCIÓN 7 · MANEJADORES HTTP (uno por cada ruta del servidor)
+// ============================================================================
 
-void handleRoot() {
-    if (WiFi.status() == WL_CONNECTED) {
-        server.send(200, "text/html", makeDashboard());
-    } else {
-        server.send(200, "text/html", makeSetupPage());
+// Ruta GET "/" -> muestra el dashboard si hay Wi-Fi, o la página de setup si no
+void handleRoot()
+{
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        server.send(200, "text/html", makeDashboard()); // Conectado: dashboard
+    }
+    else
+    {
+        server.send(200, "text/html", makeSetupPage()); // No conectado: configuración
     }
 }
 
-void handleNetworks() {
+// Ruta GET "/networks" -> escanea redes Wi-Fi y devuelve un array JSON
+// con formato [{"ssid":"...","rssi":-60}, ...]
+void handleNetworks()
+{
+    // Escaneo síncrono (false = bloquea hasta terminar), incluyendo redes ocultas (true)
     int count = WiFi.scanNetworks(false, true);
 
-    String json = "[";
-    bool first = true;
+    JsonDocument doc;                    // Documento JSON (ArduinoJson v7)
+    JsonArray arr = doc.to<JsonArray>(); // Lo usamos como array
 
-    for (int i = 0; i < count; i++) {
-        if (WiFi.SSID(i).length() == 0) {
-            continue;
-        }
+    for (int i = 0; i < count; i++)
+    {
+        if (WiFi.SSID(i).isEmpty())
+            continue; // Salta redes sin nombre (ocultas)
 
-        if (!first) json += ",";
-        first = false;
-
-        json += "{\"ssid\":\"";
-        json += jsonEscape(WiFi.SSID(i));
-        json += "\",\"rssi\":";
-        json += String(WiFi.RSSI(i));
-        json += "}";
+        JsonObject o = arr.add<JsonObject>(); // Añade un objeto al array
+        o["ssid"] = WiFi.SSID(i);             // Nombre de la red
+        o["rssi"] = WiFi.RSSI(i);             // Intensidad de señal en dBm
     }
 
-    json += "]";
-
-    WiFi.scanDelete();
-    server.send(200, "application/json", json);
+    WiFi.scanDelete(); // Libera la memoria del resultado del escaneo
+    sendJson(doc);     // Envía el JSON al navegador
 }
 
-void handleConnect() {
-    if (!server.hasArg("ssid")) {
-        server.send(
-            400,
-            "application/json",
-            "{\"ok\":false,\"message\":\"Missing SSID\"}"
-        );
+// Ruta POST "/connect" -> recibe SSID y contraseña e inicia la conexión.
+// La conexión no bloquea: se supervisa en loop() y el navegador consulta /status.
+void handleConnect()
+{
+    pendingSSID = server.arg("ssid");         // Devuelve "" si el argumento no existe
+    pendingPassword = server.arg("password"); // Contraseña tecleada por el usuario
+
+    // Un SSID vacío (o ausente) es un error del cliente -> 400 Bad Request
+    if (pendingSSID.isEmpty())
+    {
+        server.send(400, "application/json",
+                    "{\"ok\":false,\"message\":\"SSID required\"}");
         return;
     }
 
-    pendingSSID = server.arg("ssid");
-    pendingPassword = server.arg("password");
+    connectionState = STATE_CONNECTING; // Pasa al estado "conectando"
+    connectionStartedAt = millis();     // Anota cuándo empezó (para el timeout)
 
-    if (pendingSSID.length() == 0) {
-        server.send(
-            400,
-            "application/json",
-            "{\"ok\":false,\"message\":\"SSID cannot be empty\"}"
-        );
-        return;
-    }
+    WiFi.mode(WIFI_AP_STA);                                   // Mantiene el AP y permite actuar como cliente
+    WiFi.disconnect(false, false);                            // Corta intentos previos sin apagar radio ni borrar datos
+    WiFi.begin(pendingSSID.c_str(), pendingPassword.c_str()); // Inicia la conexión (no bloquea)
 
-    connectionState = STATE_CONNECTING;
-    credentialsSaved = false;
-    connectionStartedAt = millis();
-
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.disconnect(false, false);
-    WiFi.begin(pendingSSID.c_str(), pendingPassword.c_str());
-
-    server.send(
-        200,
-        "application/json",
-        "{\"ok\":true,\"message\":\"Connection started\"}"
-    );
+    server.send(200, "application/json", "{\"ok\":true}"); // Responde enseguida
 }
 
-void handleStatus() {
-    String json = "{\"state\":\"";
-    json += connectionStateName();
-    json += "\",\"ssid\":\"";
-    json += jsonEscape(WiFi.SSID());
-    json += "\",\"ip\":\"";
-    json += WiFi.localIP().toString();
-    json += "\"}";
-
-    server.send(200, "application/json", json);
+// Ruta GET "/status" -> estado actual de la conexión, SSID e IP.
+// La página de setup lo consulta cada 1,5 s para saber si ya se conectó.
+void handleStatus()
+{
+    JsonDocument doc;
+    doc["state"] = STATE_NAMES[connectionState]; // "idle", "connecting", "connected" o "failed"
+    doc["ssid"] = WiFi.SSID();                   // Red a la que está conectado
+    doc["ip"] = WiFi.localIP().toString();       // IP asignada por el router
+    sendJson(doc);
 }
 
-void handleInfo() {
-    String json = "{";
+// Ruta GET "/info" -> datos de red, hardware y sistema para el dashboard
+void handleInfo()
+{
+    bool ok = WiFi.status() == WL_CONNECTED; // ¿Hay conexión Wi-Fi ahora mismo?
 
-    json += "\"status\":\"";
-    json += WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected";
-    json += "\",";
-
-    json += "\"ssid\":\"";
-    json += jsonEscape(WiFi.SSID());
-    json += "\",";
-
-    json += "\"ip\":\"";
-    json += WiFi.localIP().toString();
-    json += "\",";
-
-    json += "\"rssi\":";
-    json += String(
-        WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0
-    );
-    json += ",";
-
-    json += "\"mac\":\"";
-    json += WiFi.macAddress();
-    json += "\",";
-
-    json += "\"chip\":\"ESP32-S3\",";
-    json += "\"cpu\":";
-    json += String(getCpuFrequencyMhz());
-    json += ",";
-
-    json += "\"flash\":";
-    json += String(ESP.getFlashChipSize());
-    json += ",";
-
-    json += "\"psram\":";
-    json += String(ESP.getPsramSize());
-    json += ",";
-
-    json += "\"uptime\":\"";
-    json += formatUptime();
-    json += "\",";
-
-    json += "\"heap\":";
-    json += String(ESP.getFreeHeap());
-    json += ",";
-
-    json += "\"freePsram\":";
-    json += String(ESP.getFreePsram());
-
-    json += "}";
-
-    server.send(200, "application/json", json);
+    JsonDocument doc;
+    doc["status"] = ok ? "Connected" : "Disconnected"; // Estado de la Wi-Fi
+    doc["ssid"] = WiFi.SSID();                         // Nombre de la red
+    doc["ip"] = WiFi.localIP().toString();             // Dirección IP
+    doc["rssi"] = ok ? WiFi.RSSI() : 0;                // Señal (0 si no hay conexión)
+    doc["mac"] = WiFi.macAddress();                    // Dirección MAC
+    doc["chip"] = ESP.getChipModel();                  // Modelo del chip (ej. ESP32-S3)
+    doc["cpu"] = getCpuFrequencyMhz();                 // Frecuencia de CPU en MHz
+    doc["flash"] = ESP.getFlashChipSize();             // Tamaño de la flash en bytes
+    doc["psram"] = ESP.getPsramSize();                 // Tamaño de la PSRAM en bytes
+    doc["uptime"] = formatUptime();                    // Tiempo encendido formateado
+    doc["heap"] = ESP.getFreeHeap();                   // Memoria heap libre en bytes
+    doc["freePsram"] = ESP.getFreePsram();             // PSRAM libre en bytes
+    sendJson(doc);
 }
 
-void handleForgetWiFi() {
-    preferences.begin("wifi-config", false);
-    preferences.remove("ssid");
-    preferences.remove("password");
-    preferences.end();
+// Ruta POST "/forget" -> borra las credenciales guardadas y reinicia en modo portal
+void handleForgetWiFi()
+{
+    preferences.begin("wifi-config", false); // Abre el espacio "wifi-config" en modo escritura
+    preferences.remove("ssid");              // Borra el SSID guardado
+    preferences.remove("password");          // Borra la contraseña guardada
+    preferences.end();                       // Cierra el espacio de almacenamiento
 
-    server.send(
-        200,
-        "application/json",
-        "{\"ok\":true,\"message\":\"Credentials removed; restarting\"}"
-    );
+    server.send(200, "application/json",
+                "{\"ok\":true,\"message\":\"Credentials removed; restarting\"}");
 
-    delay(300);
-    ESP.restart();
+    delay(300);    // Da tiempo a que la respuesta llegue al navegador
+    ESP.restart(); // Reinicia; sin credenciales arrancará el portal
 }
 
-void configureWebServer() {
-    server.on("/", HTTP_GET, handleRoot);
-    server.on("/networks", HTTP_GET, handleNetworks);
-    server.on("/connect", HTTP_POST, handleConnect);
-    server.on("/status", HTTP_GET, handleStatus);
-    server.on("/info", HTTP_GET, handleInfo);
-    server.on("/forget", HTTP_POST, handleForgetWiFi);
+// Registra todas las rutas del servidor y su función manejadora
+void configureWebServer()
+{
+    server.on("/", HTTP_GET, handleRoot);              // Página principal
+    server.on("/networks", HTTP_GET, handleNetworks);  // Escaneo de redes
+    server.on("/connect", HTTP_POST, handleConnect);   // Iniciar conexión
+    server.on("/status", HTTP_GET, handleStatus);      // Estado de la conexión
+    server.on("/info", HTTP_GET, handleInfo);          // Datos del dashboard
+    server.on("/forget", HTTP_POST, handleForgetWiFi); // Olvidar Wi-Fi
 
-    server.onNotFound([]() {
-        server.send(404, "text/plain", "Not found");
-    });
+    // Cualquier otra ruta responde 404 (función lambda anónima)
+    server.onNotFound([]()
+                      { server.send(404, "text/plain", "Not found"); });
 }
 
-// --------------------------------------------------
-// AP mode
-// --------------------------------------------------
+// ============================================================================
+//  SECCIÓN 8 · MODO PORTAL (punto de acceso de configuración)
+// ============================================================================
 
-void startPortal() {
-    connectionState = STATE_IDLE;
-    portalActive = true;
+// Crea la red "ESP32-Setup" para que el usuario configure la Wi-Fi.
+// El servidor web se arranca después, en setup().
+void startPortal()
+{
+    connectionState = STATE_IDLE; // Sin intentos de conexión en curso
+    portalActive = true;          // Marca el portal como activo (afecta al LED)
 
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    WiFi.mode(WIFI_AP_STA);            // AP (portal) + STA (para poder probar redes)
+    WiFi.softAP(AP_SSID, AP_PASSWORD); // Crea el punto de acceso
 
-    configureWebServer();
-    server.begin();
-
+    // Mensajes informativos por el monitor serie
     Serial.println();
     Serial.println("Wi-Fi setup mode active.");
     Serial.print("AP SSID: ");
     Serial.println(AP_SSID);
     Serial.print("AP IP: ");
-    Serial.println(WiFi.softAPIP());
+    Serial.println(WiFi.softAPIP()); // Normalmente 192.168.4.1
     Serial.println("Open http://192.168.4.1 in your browser.");
 }
 
-// --------------------------------------------------
-// Saved Wi-Fi connection
-// --------------------------------------------------
+// ============================================================================
+//  SECCIÓN 9 · CONEXIÓN CON LA WI-FI GUARDADA
+// ============================================================================
 
-bool connectSavedWiFi() {
-    preferences.begin("wifi-config", true);
-    String ssid = preferences.getString("ssid", "");
-    String password = preferences.getString("password", "");
-    preferences.end();
+// Intenta conectar con las credenciales guardadas en flash.
+// Devuelve true si conectó, false si no había datos o falló.
+// Es bloqueante (espera hasta CONNECT_TIMEOUT_MS) pero mantiene el LED animado.
+bool connectSavedWiFi()
+{
+    preferences.begin("wifi-config", true);                  // Abre en modo solo lectura (true)
+    String ssid = preferences.getString("ssid", "");         // Lee el SSID ("" si no existe)
+    String password = preferences.getString("password", ""); // Lee la contraseña
+    preferences.end();                                       // Cierra el almacenamiento
 
-    if (ssid.length() == 0) {
-        return false;
-    }
+    if (ssid.isEmpty())
+        return false; // No hay red guardada -> usar portal
 
     Serial.print("Connecting to saved network: ");
     Serial.println(ssid);
 
-    connectionState = STATE_CONNECTING;
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid.c_str(), password.c_str());
+    connectionState = STATE_CONNECTING;         // Estado "conectando" (LED amarillo)
+    WiFi.mode(WIFI_STA);                        // Solo modo cliente
+    WiFi.begin(ssid.c_str(), password.c_str()); // Inicia la conexión
 
-    uint32_t started = millis();
+    uint32_t started = millis(); // Momento de inicio, para el timeout
 
+    // Espera hasta conectar o agotar el tiempo, animando el LED mientras tanto
     while (WiFi.status() != WL_CONNECTED &&
-           millis() - started < CONNECT_TIMEOUT_MS) {
+           millis() - started < CONNECT_TIMEOUT_MS)
+    {
         updateStatusLED();
         delay(10);
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
+    // Si no se conectó a tiempo: apaga la radio, marca el fallo y devuelve false
+    if (WiFi.status() != WL_CONNECTED)
+    {
         Serial.println("Saved Wi-Fi connection failed.");
-        WiFi.disconnect(true, false);
+        WiFi.disconnect(true, false); // Apaga la Wi-Fi sin borrar datos
         connectionState = STATE_FAILED;
         return false;
     }
 
+    // Conexión correcta
     connectionState = STATE_CONNECTED;
-    connectedAt = millis();
-
-    configureWebServer();
-    server.begin();
+    connectedAt = millis(); // Anota el momento de conexión
 
     Serial.println("Connected to saved Wi-Fi.");
     Serial.print("Dashboard IP: ");
     Serial.println(WiFi.localIP());
-
     return true;
 }
 
-// --------------------------------------------------
-// Setup
-// --------------------------------------------------
+// ============================================================================
+//  SECCIÓN 10 · SETUP (se ejecuta una vez al arrancar)
+// ============================================================================
 
-void setup() {
-    Serial.begin(115200);
-    delay(300);
+void setup()
+{
+    Serial.begin(115200); // Inicia el puerto serie a 115200 baudios
+    delay(300);           // Pequeña pausa para estabilizar el serie
 
-    // Initialise the onboard RGB LED.
-    neopixelWrite(RGB_LED_PIN, 0, 0, 0);
+    neopixelWrite(RGB_LED_PIN, 0, 0, 0); // Asegura que el LED empieza apagado
 
     Serial.println();
     Serial.println("ESP32-S3 starting...");
 
-    if (!connectSavedWiFi()) {
+    // Si no se puede conectar con lo guardado, se abre el portal de configuración
+    if (!connectSavedWiFi())
         startPortal();
-    }
+
+    configureWebServer(); // Registra las rutas (una sola vez)
+    server.begin();       // Arranca el servidor HTTP
 }
 
-// --------------------------------------------------
-// Main loop
-// --------------------------------------------------
+// ============================================================================
+//  SECCIÓN 11 · LOOP (se ejecuta continuamente)
+// ============================================================================
 
-void loop() {
-    server.handleClient();
-    updateStatusLED();
+void loop()
+{
+    server.handleClient(); // Atiende las peticiones HTTP pendientes
+    updateStatusLED();     // Mantiene el LED actualizado
 
-    if (connectionState == STATE_CONNECTING) {
-        if (WiFi.status() == WL_CONNECTED) {
+    // ---- Supervisar la conexión iniciada desde el portal ----
+    if (connectionState == STATE_CONNECTING)
+    {
+
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            // Éxito: la red y la contraseña son correctas
             connectionState = STATE_CONNECTED;
             connectedAt = millis();
 
-            if (pendingSSID.length() > 0) {
-                preferences.begin("wifi-config", false);
+            // Guarda las credenciales en flash solo ahora que se sabe que funcionan
+            if (pendingSSID.length() > 0)
+            {
+                preferences.begin("wifi-config", false); // Modo escritura
                 preferences.putString("ssid", pendingSSID);
                 preferences.putString("password", pendingPassword);
                 preferences.end();
-
-                credentialsSaved = true;
             }
 
-            pendingPassword = "";
+            pendingPassword = ""; // Borra la contraseña de la RAM
 
             Serial.println("Wi-Fi connected.");
             Serial.print("SSID: ");
@@ -890,28 +894,30 @@ void loop() {
             Serial.print("Dashboard IP: ");
             Serial.println(WiFi.localIP());
         }
-        else if (millis() - connectionStartedAt >= CONNECT_TIMEOUT_MS) {
+        else if (millis() - connectionStartedAt >= CONNECT_TIMEOUT_MS)
+        {
+            // Fallo: se agotó el tiempo sin conseguir conexión
             connectionState = STATE_FAILED;
-            pendingPassword = "";
-
+            pendingPassword = ""; // Borra la contraseña de la RAM
             Serial.println("Wi-Fi connection timed out.");
         }
     }
 
-    // Shut down the setup AP 10 seconds after successful connection.
+    // ---- Apagar el AP de configuración tras conectar con éxito ----
+    // Se espera AP_SHUTDOWN_DELAY_MS para que el navegador alcance a mostrar la IP.
     if (portalActive &&
         connectionState == STATE_CONNECTED &&
-        millis() - connectedAt >= AP_SHUTDOWN_DELAY_MS) {
+        millis() - connectedAt >= AP_SHUTDOWN_DELAY_MS)
+    {
 
-        WiFi.softAPdisconnect(true);
-        WiFi.mode(WIFI_STA);
-
-        portalActive = false;
+        WiFi.softAPdisconnect(true); // Apaga el punto de acceso
+        WiFi.mode(WIFI_STA);         // Deja solo el modo cliente
+        portalActive = false;        // El portal ya no está activo
 
         Serial.println("Setup AP disabled.");
         Serial.print("Dashboard remains available at: http://");
         Serial.println(WiFi.localIP());
     }
 
-    delay(2);
+    delay(2); // Cede tiempo a otras tareas del sistema
 }
