@@ -168,43 +168,6 @@ a { color: var(--accent); }
 .status-box.fail { border-left-color: var(--bad); }
 .status-box p { margin: 0; }
 
-/* Floating settings button + modal (holds Forget Wi-Fi, always reachable) */
-.fab {
-    position: fixed;
-    right: 18px;
-    bottom: 18px;
-    width: auto;
-    margin: 0;
-    padding: 12px 16px;
-    border-radius: 999px;
-    font-size: 1.25rem;
-    line-height: 1;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, .25);
-    z-index: 50;
-}
-.modal-overlay {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, .45);
-    z-index: 100;
-    align-items: center;
-    justify-content: center;
-    padding: 20px;
-}
-.modal-overlay.open { display: flex; }
-.modal {
-    background: var(--card);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 20px;
-    width: 100%;
-    max-width: 420px;
-}
-.modal h2 { margin-top: 0; }
-.modal button { width: 100%; }
-
 /* ===================== TABS (manila-folder style) ===================== */
 .tabs {
     display: flex;
@@ -217,7 +180,7 @@ a { color: var(--accent); }
     max-width: 180px;
     padding: 12px 16px;
     margin: 0;
-    border: 2px solid transparent;
+    border: 2px solid var(--border);
     border-bottom: none;
     border-radius: 10px 10px 0 0;
     background: var(--bg);
@@ -334,27 +297,11 @@ document.addEventListener('DOMContentLoaded', function () {
             <div class="name">Soroll</div>
             <div class="value"><span id="noise">--</span></div>
         </div>
-        <div class="stat sensor empty" id="card-chemicals">
-            <div class="icon">🧪</div>
-            <div class="name">Químics</div>
-            <div class="value"><span id="chemicals">--</span></div>
-        </div>
         <div class="stat sensor empty" id="card-airQuality">
             <div class="icon">🍃</div>
             <div class="name small">Qualitat d'aire</div>
             <div class="value"><span id="airQuality">--</span></div>
         </div>
-    </div>
-</section>
-
-<section class="card">
-    <h2>Network</h2>
-    <div class="grid">
-        <div class="stat"><div class="muted">Status</div><div class="value" id="wifiStatus">Connected</div></div>
-        <div class="stat"><div class="muted">SSID</div><div class="value" id="ssid">-</div></div>
-        <div class="stat"><div class="muted">IP address</div><div class="value" id="ip">-</div></div>
-        <div class="stat"><div class="muted">Signal strength</div><div class="value" id="rssi">-</div></div>
-        <div class="stat"><div class="muted">MAC address</div><div class="value" id="mac">-</div></div>
     </div>
 </section>
 
@@ -414,6 +361,23 @@ document.addEventListener('DOMContentLoaded', function () {
     </p>
 </section>
 
+<!-- ============ NETWORK STATUS (shown when connected) ============ -->
+<section class="card" id="networkStatusCard" style="display:none;">
+    <h2>Network status</h2>
+    <div class="grid">
+        <div class="stat"><div class="muted">Status</div><div class="value" id="wifiStatus">Connected</div></div>
+        <div class="stat"><div class="muted">SSID</div><div class="value" id="ssid">-</div></div>
+        <div class="stat"><div class="muted">IP address</div><div class="value" id="ip">-</div></div>
+        <div class="stat"><div class="muted">Signal strength</div><div class="value" id="rssi">-</div></div>
+        <div class="stat"><div class="muted">MAC address</div><div class="value" id="mac">-</div></div>
+    </div>
+    <p class="muted" style="margin-top:16px;">
+        Forgetting the saved network erases the stored credentials
+        and restarts the ESP32 in setup mode.
+    </p>
+    <button type="button" class="danger" onclick="forgetWiFi()">Forget Wi-Fi</button>
+</section>
+
 <script>
 /* ---- MODO DEMO: solo si abres el archivo directamente en el navegador (file://).
         En el ESP32 se usan los endpoints reales:
@@ -465,24 +429,13 @@ function setStatus(text, kind) {
     statusBox.className = 'status-box' + (kind ? ' ' + kind : '');
 }
 
-/* Hide the Wi-Fi configuration card once the board is connected. */
-function showWifiCard(show) {
-    const card = document.getElementById('wifiCard');
-    if (card) card.style.display = show ? '' : 'none';
+/* Toggle between Wi-Fi config (when disconnected) and network status (when connected). */
+function showNetworkView(connected) {
+    const configCard = document.getElementById('wifiCard');
+    const statusCard = document.getElementById('networkStatusCard');
+    if (configCard) configCard.style.display = connected ? 'none' : '';
+    if (statusCard) statusCard.style.display = connected ? '' : 'none';
 }
-
-/* Settings popup, holds the Forget Wi-Fi action so it stays reachable. */
-function openSettings() {
-    const modal = document.getElementById('settingsModal');
-    if (modal) modal.classList.add('open');
-}
-function closeSettings() {
-    const modal = document.getElementById('settingsModal');
-    if (modal) modal.classList.remove('open');
-}
-document.addEventListener('keydown', function (event) {
-    if (event.key === 'Escape') closeSettings();
-});
 
 /* Tab switching */
 function switchTab(name) {
@@ -527,6 +480,7 @@ async function pollStatus() {
                 '. Open this address after the setup network closes.', 'ok');
             connectButton.disabled = false;
             statusPolling = false;
+            showNetworkView(true);
             refreshInfo();
             return;
         }
@@ -561,6 +515,7 @@ async function refreshStatus() {
         } else {
             setStatus('Setup access point active. Select a network below.');
         }
+        showNetworkView(result.state === 'connected');
         return result.state;
     } catch (error) {
         setStatus('Connection status unavailable. Check the serial monitor.', 'fail');
@@ -615,20 +570,24 @@ function bytes(value) {
 /* ---- API de sensores (para el compañero) ----
    setSensor('humidity', 52.3)  -> escribe el valor en <span id="humidity">
    Un valor null/undefined deja "--".                                      */
-function setSensor(id, value, decimals = 1) {
+function setSensor(id, value, decimals = 1, unit = '') {
     const el = document.getElementById(id);
     const card = document.getElementById('card-' + id);
     const valid = typeof value === 'number' && isFinite(value);
-    el.textContent = valid ? value.toFixed(decimals) : '--';
+    el.textContent = valid ? value.toFixed(decimals) + unit : '--';
     if (card) card.classList.toggle('empty', !valid);
 }
 
 function setSensors(d) {
-    setSensor('temperature', d.temperature);
-    setSensor('humidity',    d.humidity);
-    setSensor('noise',       d.noise);
-    setSensor('chemicals',   d.chemicals);
-    setSensor('airQuality',  d.airQuality, 0);
+    setSensor('temperature', d.temperature, 1, ' °C');
+    setSensor('humidity',    d.humidity,    1, ' %');
+    setSensor('noise',       d.noise,       0, ' dB');
+    // airQuality is now a string label: "Great"/"Good"/"Bad"/"Worse"
+    const aqEl = document.getElementById('airQuality');
+    const aqCard = document.getElementById('card-airQuality');
+    const valid = typeof d.airQuality === 'string' && d.airQuality !== '--';
+    aqEl.textContent = valid ? d.airQuality : '--';
+    if (aqCard) aqCard.classList.toggle('empty', !valid);
 }
 
 async function refreshSensors() {
@@ -644,6 +603,8 @@ async function refreshInfo() {
     try {
         const d = await api('/info');
         const online = d.status === 'Connected';
+
+        showNetworkView(online);
 
         setText('wifiStatus', d.status || 'Unavailable');
         setText('ssid', online ? (d.ssid || '-') : '-');
@@ -688,23 +649,6 @@ async function forgetWiFi() {
     setInterval(refreshStatus, 10000);
 })();
 </script>
-
-<!-- ============ SETTINGS / FORGET WI-FI (always available) ============ -->
-<button id="settingsFab" class="fab" aria-label="Wi-Fi settings"
-    onclick="openSettings()">⚙️</button>
-
-<div id="settingsModal" class="modal-overlay"
-    onclick="if (event.target === this) closeSettings()">
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
-        <h2 id="settingsTitle">Wi-Fi settings</h2>
-        <p class="muted">
-            Forgetting the saved network erases the stored credentials
-            and restarts the ESP32 in setup mode.
-        </p>
-        <button type="button" class="danger" onclick="forgetWiFi()">Forget Wi-Fi</button>
-        <button type="button" class="secondary" onclick="closeSettings()">Close</button>
-    </div>
-</div>
 
 <p class="muted" style="text-align:center;font-size:.85rem">ESP32-S3 · Local web interface</p>
 </main>

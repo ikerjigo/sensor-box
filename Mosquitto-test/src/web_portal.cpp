@@ -167,12 +167,12 @@ static void handleSensors() {
   }
 
   doc["noise"] = micLevel;        // mic decision level (same as the OLED)
-  doc["chemicals"] = gasVoltage;  // MQ135 module voltage
-
   if (isnan(gasRsRo)) {
+    doc["chemicals"] = nullptr;
     doc["airQuality"] = nullptr;
   } else {
-    doc["airQuality"] = airQualityScore(gasRsRo);
+    doc["chemicals"] = gasRsRo;                     // MQ135 Rs/Ro ratio
+    doc["airQuality"] = airQualityLabel(gasRsRo);  // "Great"/"Good"/"Bad"/"Worse"
   }
 
   sendJson(doc);
