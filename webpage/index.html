@@ -163,6 +163,79 @@ a { color: var(--accent); }
 .status-box.ok   { border-left-color: var(--ok); }
 .status-box.fail { border-left-color: var(--bad); }
 .status-box p { margin: 0; }
+
+/* Floating settings button + modal (holds Forget Wi-Fi, always reachable) */
+.fab {
+    position: fixed;
+    right: 18px;
+    bottom: 18px;
+    width: auto;
+    margin: 0;
+    padding: 12px 16px;
+    border-radius: 999px;
+    font-size: 1.25rem;
+    line-height: 1;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, .25);
+    z-index: 50;
+}
+.modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, .45);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+.modal-overlay.open { display: flex; }
+.modal {
+    background: var(--card);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px;
+    width: 100%;
+    max-width: 420px;
+}
+.modal h2 { margin-top: 0; }
+.modal button { width: 100%; }
+
+/* ===================== TABS (manila-folder style) ===================== */
+.tabs {
+    display: flex;
+    gap: 4px;
+    margin: 8px 0 16px;
+    border-bottom: 2px solid var(--border);
+}
+.tabs button {
+    flex: 1;
+    max-width: 180px;
+    padding: 12px 16px;
+    margin: 0;
+    border: 2px solid transparent;
+    border-bottom: none;
+    border-radius: 10px 10px 0 0;
+    background: var(--bg);
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: background .15s, color .15s, border-color .15s;
+    z-index: 1;
+    position: relative;
+    bottom: -2px; /* overlap the border */
+}
+.tabs button:hover { color: var(--text); background: var(--card); }
+.tabs button[aria-selected="true"] {
+    background: var(--card);
+    color: var(--accent);
+    border-color: var(--border);
+    border-bottom-color: var(--card); /* visually connects to panel */
+}
+.tab-panel { display: none; }
+.tab-panel.active { display: block; animation: fadeIn .15s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 </style>
 <script>
 /* Tema: se aplica antes de pintar la página (sin parpadeo) y se recuerda entre visitas. */
@@ -201,43 +274,30 @@ document.addEventListener('DOMContentLoaded', function () {
     </select>
 </header>
 
-<!-- ============ CONFIGURACIÓN WI-FI ============ -->
-<section class="card">
-    <h2>Wi-Fi configuration</h2>
-    <p class="muted">
-        Select your network and enter its password.
-        The setup access point will shut down after a successful connection.
-    </p>
+<!-- ============ TAB NAVIGATION ============ -->
+<div class="tabs" role="tablist" aria-label="Dashboard sections">
+    <button role="tab" id="tab-data" class="active" aria-selected="true"
+        aria-controls="panel-data" onclick="switchTab('data')">Data</button>
+    <button role="tab" id="tab-network" aria-selected="false"
+        aria-controls="panel-network" onclick="switchTab('network')">Network</button>
+</div>
 
-    <form id="wifiForm">
-        <label for="ssidSelect">Wi-Fi network</label>
-        <select id="ssidSelect" name="ssid" required>
-            <option value="">Scan for networks</option>
-        </select>
+<!-- ============ DATA TAB PANEL ============ -->
+<div id="panel-data" class="tab-panel active" role="tabpanel" aria-labelledby="tab-data">
 
-        <button type="button" class="secondary" onclick="scanNetworks()">Scan networks</button>
-
-        <label for="password">Wi-Fi password</label>
-        <input id="password" name="password" type="password"
-            autocomplete="current-password" placeholder="Enter password">
-
-        <button id="connectButton" type="submit">Connect</button>
-    </form>
-
-    <div id="statusBox" class="status-box">
-        <p id="status" class="status">Setup access point active</p>
-    </div>
-    <p class="muted">
-        If the connection succeeds, find the ESP32's IP address
-        in your router or the serial monitor.
-    </p>
-
-    <p class="muted">
-        Forgetting the saved network erases the stored credentials
-        and restarts the ESP32 in setup mode.
-    </p>
-    <button type="button" class="danger" onclick="forgetWiFi()">Forget Wi-Fi</button>
-</section>
+<!-- ============ SENSORES Y DASHBOARD ============ -->
+<!--
+  IDs para el firmware / el compañero (el <span> contiene SOLO el número, sin unidades):
+    temperature  -> Temperatura
+    humidity     -> Humitat
+    noise        -> Soroll
+    chemicals    -> Químics
+    airQuality   -> Qualitat d'aire
+  Desde JS: setSensor('temperature', 23.5)  ó  setSensors({temperature: 23.5, ...})
+  La página pide los valores a GET /sensors cada 3 s (ver script).
+  Este bloque se ve con y sin Wi-Fi. La tarjeta "Qualitat d'aire" usa una
+  fuente menor para que todas las filas queden exactamente igual de altas.
+-->
 
 <!-- ============ SENSORES Y DASHBOARD ============ -->
 <!--
@@ -313,6 +373,43 @@ document.addEventListener('DOMContentLoaded', function () {
     </div>
 </section>
 
+</div> <!-- end panel-data -->
+
+<!-- ============ NETWORK TAB PANEL ============ -->
+<div id="panel-network" class="tab-panel" role="tabpanel" aria-labelledby="tab-network">
+
+<!-- ============ CONFIGURACIÓN WI-FI ============ -->
+<section class="card" id="wifiCard">
+    <h2>Wi-Fi configuration</h2>
+    <p class="muted">
+        Select your network and enter its password.
+        The setup access point will shut down after a successful connection.
+    </p>
+
+    <form id="wifiForm">
+        <label for="ssidSelect">Wi-Fi network</label>
+        <select id="ssidSelect" name="ssid" required>
+            <option value="">Scan for networks</option>
+        </select>
+
+        <button type="button" class="secondary" onclick="scanNetworks()">Scan networks</button>
+
+        <label for="password">Wi-Fi password</label>
+        <input id="password" name="password" type="password"
+            autocomplete="current-password" placeholder="Enter password">
+
+        <button id="connectButton" type="submit">Connect</button>
+    </form>
+
+    <div id="statusBox" class="status-box">
+        <p id="status" class="status">Setup access point active</p>
+    </div>
+    <p class="muted">
+        If the connection succeeds, find the ESP32's IP address
+        in your router or the serial monitor.
+    </p>
+</section>
+
 <script>
 /* ---- MODO DEMO: solo si abres el archivo directamente en el navegador (file://).
         En el ESP32 se usan los endpoints reales:
@@ -362,6 +459,43 @@ const ssidSelect = document.getElementById('ssidSelect');
 function setStatus(text, kind) {
     statusEl.textContent = text;
     statusBox.className = 'status-box' + (kind ? ' ' + kind : '');
+}
+
+/* Hide the Wi-Fi configuration card once the board is connected. */
+function showWifiCard(show) {
+    const card = document.getElementById('wifiCard');
+    if (card) card.style.display = show ? '' : 'none';
+}
+
+/* Settings popup, holds the Forget Wi-Fi action so it stays reachable. */
+function openSettings() {
+    const modal = document.getElementById('settingsModal');
+    if (modal) modal.classList.add('open');
+}
+function closeSettings() {
+    const modal = document.getElementById('settingsModal');
+    if (modal) modal.classList.remove('open');
+}
+document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape') closeSettings();
+});
+
+/* Tab switching */
+function switchTab(name) {
+    const dataTab = document.getElementById('tab-data');
+    const networkTab = document.getElementById('tab-network');
+    const dataPanel = document.getElementById('panel-data');
+    const networkPanel = document.getElementById('panel-network');
+
+    if (name === 'data') {
+        dataTab.classList.add('active'); dataTab.setAttribute('aria-selected', 'true');
+        networkTab.classList.remove('active'); networkTab.setAttribute('aria-selected', 'false');
+        dataPanel.classList.add('active'); networkPanel.classList.remove('active');
+    } else {
+        networkTab.classList.add('active'); networkTab.setAttribute('aria-selected', 'true');
+        dataTab.classList.remove('active'); dataTab.setAttribute('aria-selected', 'false');
+        networkPanel.classList.add('active'); dataPanel.classList.remove('active');
+    }
 }
 
 async function scanNetworks() {
@@ -550,6 +684,23 @@ async function forgetWiFi() {
     setInterval(refreshStatus, 10000);
 })();
 </script>
+
+<!-- ============ SETTINGS / FORGET WI-FI (always available) ============ -->
+<button id="settingsFab" class="fab" aria-label="Wi-Fi settings"
+    onclick="openSettings()">⚙️</button>
+
+<div id="settingsModal" class="modal-overlay"
+    onclick="if (event.target === this) closeSettings()">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+        <h2 id="settingsTitle">Wi-Fi settings</h2>
+        <p class="muted">
+            Forgetting the saved network erases the stored credentials
+            and restarts the ESP32 in setup mode.
+        </p>
+        <button type="button" class="danger" onclick="forgetWiFi()">Forget Wi-Fi</button>
+        <button type="button" class="secondary" onclick="closeSettings()">Close</button>
+    </div>
+</div>
 
 <p class="muted" style="text-align:center;font-size:.85rem">ESP32-S3 · Local web interface</p>
 </main>

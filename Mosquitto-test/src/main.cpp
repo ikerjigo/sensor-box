@@ -19,6 +19,7 @@
 #include <DHT.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "web_portal.h"
 
 /** Pin definitions */
 #define VOLUME_SENSOR_PIN 4   // ADC input for electret microphone module
@@ -234,6 +235,8 @@ void setup() {
   Serial.println();
 
   lastPageSwitch = millis();  // Start the OLED on page 0 for a full interval
+
+  webSetup();  // Connect to saved Wi-Fi, or raise the "ESP32-Setup" portal
 }
 
 /** Result of a microphone sampling window */
@@ -486,6 +489,8 @@ void updateDisplay() {
  * The speaker sequencer is driven by millis(), no long blocking delays.
  */
 void loop() {
+  webLoop();  // Service the Wi-Fi portal / web dashboard
+
   uint32_t now = millis();
 
   // Advance to the next step when the current one is done
