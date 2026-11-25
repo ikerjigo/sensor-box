@@ -6,12 +6,14 @@
  * - PWM speaker on GPIO13
  * - I2C OLED display (SSD1306 128x64): SDA on GPIO10, SCL on GPIO9
  *
- * Mic detection uses hramos's "max + average confirmation" window:
- * a short window tracks max/min/sum; if the max clears the threshold, the
- * average decides whether to trigger, so a single spike alone won't fire it.
- * The electret module has a DC bias, so samples are first converted to their
- * deviation from a slowly-tracked baseline before applying that logic.
- * raw peak-to-peak is kept only as a diagnostic value.
+ * Mic detection uses a peak window with a consecutive-window debounce:
+ * each window tracks the maximum deviation from a slowly tracked DC baseline;
+ * a trigger requires that peak to clear NOISE_THRESHOLD for
+ * MIC_TRIGGER_WINDOWS consecutive windows, so a single spike alone won't fire
+ * it and the decision does not depend on the waveform's average/crest factor.
+ * The electret module has a DC bias, so samples are converted to their
+ * deviation from the baseline before the peak is taken.
+ * Raw peak-to-peak and average are kept only as diagnostics.
  */
 
 #include <Arduino.h>
@@ -39,21 +41,16 @@
 #define VREF 3.3                // Reference voltage in volts
 
 /**
- * Noise threshold in ADC counts (hramos's tuning). The window max must clear
- * it before the average is even considered. Calibrate with the printed
- * "max / avg / p-p" values: max must be low in silence and high when noisy.
+ * Noise threshold in ADC counts for the peak deviation of a window.
+ * Calibrate with the printed "peak / avg / p-p" values: peak must stay low
+ * in silence and rise clearly when noisy. Because the old average-confirmation
+ * step is gone, this is now the actual peak threshold; raise it if the alarm
+ * becomes too sensitive.
  */
 #define NOISE_THRESHOLD 60
 
-/**
- * Margin for rounding the average up to the threshold:
- * with margin 2, an average of 59 counts as 60 (triggers); 54 does not.
- */
-#define ROUND_MARGIN 2
-
 /** MQ135 configuration */
-#define GAS_ADC_MAX 4095.0      // ESP32-S3 12-bit ADC
-#define GAS_VREF 3.3            // Reference voltage
+#define GAS_VCC 5.0             // MQ135 module supply voltage (V)
 #define GAS_DIVIDER_RATIO 2.0   // Voltage divider: 10k+10k = /2, so multiply by 2 to get module voltage
 #define GAS_RO_CLEAN_AIR 10000.0 // Approximate Ro in clean air (ohms) - needs calibration
 #define GAS_RL 10000.0          // Load resistor on module (ohms)
@@ -70,17 +67,22 @@
 /** Sequence limits */
 #define MAX_STEPS 32            // Max steps in a beep sequence
 
-/** Read scheduling (decoupled, non-blocking) */
+/** Read scheduling (mostly non-blocking) */
 const uint32_t MIC_INTERVAL_MS = 100;  // How often the mic is measured (ms)
-const uint32_t MIC_WINDOW_MS = 20;     // Mic sampling window length (ms)
+const uint32_t MIC_WINDOW_MS = 50;     // Mic window (ms): >=1 cycle down to 20 Hz
 const uint32_t DHT_INTERVAL_MS = 2000; // How often the DHT11 is read (ms)
+const uint32_t DHT_RETRY_MS = 1000;    // Delay before a failed DHT read is retried (ms)
 const uint32_t GAS_INTERVAL_MS = 1000; // How often the MQ135 is read (ms)
 const uint32_t PRINT_INTERVAL_MS = 1000; // How often all values are printed together (ms)
 const uint32_t DISPLAY_SWITCH_MS = 2000; // How often the OLED switches value pairs (ms)
-const uint32_t DISPLAY_REFRESH_MS = 150; // How often the OLED is redrawn (ms) - enables flashing
+const uint32_t DISPLAY_REFRESH_NORMAL_MS = 500; // OLED refresh in normal pages (ms)
+const uint32_t DISPLAY_REFRESH_ALERT_MS = 100;  // OLED refresh while alert flashes (ms)
 const uint32_t ALERT_FLASH_MS = 200;     // Alert flash half-period (ms)
 const uint32_t ALERT_HOLD_MS = 5000;     // Alarm stays active this long after last noise (ms)
-const uint8_t MAX_READ_RETRIES = 3;    // Retry attempts for DHT reads
+const uint32_t SPEAKER_GUARD_MS = 50;    // Ignore mic this long after a beep ends (ms)
+const uint32_t BEEP_GAP_MS = 300;        // Silence between beep sequences (ms)
+const uint8_t MIC_TRIGGER_WINDOWS = 2;   // Consecutive over-threshold windows needed to trigger
+const uint8_t MAX_READ_RETRIES = 3;      // Total DHT attempts before marking it invalid
 
 /** DHT sensor type */
 #define DHT_TYPE DHT11
@@ -94,6 +96,7 @@ DHT dht(TEMP_HUMIDITY_PIN, DHT_TYPE);
 /** OLED display instance */
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 uint8_t oledAddr = OLED_ADDR_DEFAULT; // Actual address, set by the I2C scan
+bool displayReady = false;            // True once display.begin() succeeds
 
 /** Sequencer state */
 struct Step { uint32_t hz; uint32_t ms; };
@@ -102,6 +105,7 @@ int seqLen = 0;      // Number of steps in current sequence
 int seqPos = 0;      // Current step index
 bool playing = false; // True while a sequence is active
 unsigned long stepStart = 0; // Timestamp of current step start
+uint32_t lastSpeakerEnd = 0; // Timestamp when the last beep sequence ended
 
 /** Timestamps of the last read of each sensor */
 uint32_t lastMicRead = 0;
@@ -114,6 +118,8 @@ uint8_t  displayPage = 0;   // 0 = Mic + Air, 1 = Temp + Hum
 bool     alertActive = false; // True while the noise level is above the threshold
 uint32_t lastNoiseTime = 0;   // Timestamp of last noise trigger
 bool     alarmLatched = false; // Latches true after first trigger, cleared after hold
+uint8_t  noiseWindowCount = 0; // Consecutive windows above the threshold
+uint8_t  dhtFailCount = 0;     // Consecutive DHT failures in the current cycle
 
 /** Latest sensor values, kept so all can be printed together */
 int   micLevel      = 0;      // Decision level compared to NOISE_THRESHOLD
@@ -203,16 +209,19 @@ void setup() {
   pinMode(VOLUME_SENSOR_PIN, INPUT);
   pinMode(GAS_SENSOR_PIN, INPUT);
   analogReadResolution(12);
+  analogSetAttenuation(ADC_11db); // Explicit ~0-3.1 V range for both ADC inputs
 
   // Start I2C on the OLED pins and auto-detect the display address
   Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000); // Faster OLED refresh; most SSD1306 modules support 400 kHz
   Serial.printf("Scanning I2C (SDA=%d, SCL=%d)...\n", OLED_SDA, OLED_SCL);
   uint8_t found = findI2CDevice();
   if (found != 0) {
     oledAddr = found;
   }
   Serial.printf("Using OLED address 0x%02X\n", oledAddr);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, oledAddr)) {
+  displayReady = display.begin(SSD1306_SWITCHCAPVCC, oledAddr);
+  if (!displayReady) {
     Serial.println("SSD1306 init FAILED (check wiring/address/controller)");
   } else {
     display.clearDisplay();
@@ -238,19 +247,18 @@ void setup() {
 
 /** Result of a microphone sampling window */
 struct MicWindow {
-  int maxLevel;    // Maximum |sample - DC baseline| in the window
-  int avgLevel;    // Average |sample - DC baseline| in the window
+  int maxLevel;    // Peak |sample - DC baseline| in the window (decision value)
+  int avgLevel;    // Average |sample - DC baseline| (diagnostic only)
   int peakToPeak;  // Raw peak-to-peak amplitude (diagnostic only)
 };
 
 /**
  * @brief Sample the microphone for one window, removing the DC bias.
  * The resting offset is tracked with a slow exponential moving average; each
- * sample is converted to its absolute deviation from that offset. This keeps
- * hramos's max + average confirmation working even though the electret module
- * has a DC bias (the raw mean would otherwise sit far above the threshold and
- * trigger constantly).
- * @return MicWindow with AC max/average levels and the raw peak-to-peak
+ * sample is converted to its absolute deviation from that offset. The window
+ * returns the peak deviation (used for the decision) plus average and raw
+ * peak-to-peak diagnostics.
+ * @return MicWindow with AC peak/average levels and the raw peak-to-peak
  */
 MicWindow readMicWindow() {
   int minValue = 4095;
@@ -283,9 +291,13 @@ MicWindow readMicWindow() {
   result.avgLevel = (count > 0) ? (int)(sumLevel / count) : 0;
   result.peakToPeak = maxValue - minValue;
 
-  // Track the resting DC offset slowly: follows drift, ignores short noise
+  // Track the resting DC offset slowly: follows drift, ignores short noise.
+  // On the very first window there is no baseline yet, so use the window's
+  // peak-to-peak as an initial level and establish the baseline afterwards.
   if (micBaseline < 0) {
     micBaseline = mean;
+    result.maxLevel = (maxValue >= minValue) ? (maxValue - minValue) / 2 : 0;
+    result.avgLevel = result.maxLevel;
   } else {
     micBaseline = (micBaseline * 7 + mean) / 8;
   }
@@ -293,86 +305,77 @@ MicWindow readMicWindow() {
   return result;
 }
 
-/** Final decision of the max + average algorithm */
+/** Result of the per-window peak decision */
 struct MicDecision {
-  int level;    // Final level compared to the threshold
-  bool trigger; // true if the speaker should be triggered
+  int level;           // Peak level of the window
+  bool aboveThreshold; // true if the peak clears NOISE_THRESHOLD
 };
 
 /**
- * @brief Apply the max + average confirmation rule (hramos's logic).
- * Operates on the DC-removed levels from readMicWindow().
- * - If the max does not clear the threshold: no trigger, keep the max.
- * - If the max clears the threshold, the average decides:
- *   - avg > threshold: keep the average and trigger.
- *   - avg within ROUND_MARGIN below the threshold: round up and trigger.
- *   - avg well below the threshold (e.g. 54, 49...): do not trigger.
+ * @brief Compare one window's peak against the noise threshold.
+ * The consecutive-window debounce is applied by the caller, so a single
+ * spike cannot trigger the alarm.
  * @param w The sampled window
- * @return The decision level and whether to trigger
+ * @return The window peak and whether it is above the threshold
  */
 MicDecision decideMicLevel(const MicWindow &w) {
-  if (w.maxLevel <= NOISE_THRESHOLD) {
-    return { w.maxLevel, false };
-  }
-  if (w.avgLevel > NOISE_THRESHOLD) {
-    return { w.avgLevel, true };
-  }
-  if (w.avgLevel >= NOISE_THRESHOLD - ROUND_MARGIN) {
-    return { NOISE_THRESHOLD, true };
-  }
-  return { w.avgLevel, false };
+  return { w.maxLevel, w.maxLevel > NOISE_THRESHOLD };
 }
 
 /**
- * @brief Read DHT11 with retry logic
- * Returns true on success, false on failure (NaN values)
+ * @brief Read DHT11 once, forcing a real sensor read.
+ * Returns true on success, false on failure. Retry scheduling is handled by
+ * loop(), so this function never blocks for long.
  * @param humidity output parameter for humidity reading
  * @param temperature output parameter for temperature reading
  * @return true if read successful, false otherwise
  */
 bool readDHT(float& humidity, float& temperature) {
-  for (uint8_t attempt = 1; attempt <= MAX_READ_RETRIES; attempt++) {
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
-
-    if (!isnan(h) && !isnan(t)) {
-      humidity = h;
-      temperature = t;
-      return true;
-    }
-
-    if (attempt < MAX_READ_RETRIES) {
-      delay(200);  // Brief pause between retries
-    }
+  // DHT::read(true) forces the actual sensor read; readHumidity() and
+  // readTemperature() then return the cached values. Without force, the
+  // Adafruit library returns the previous result for up to 2 s, so retrying
+  // in a fast loop would keep returning the same failure.
+  if (!dht.read(true)) {
+    return false;
   }
-  return false;
+
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  if (isnan(h) || isnan(t)) {
+    return false;
+  }
+
+  humidity = h;
+  temperature = t;
+  return true;
 }
 
 /**
  * @brief Read MQ135 gas sensor (AO pin via voltage divider)
- * Returns sensor voltage and estimated Rs/Ro ratio
- * @param gasVoltage output: sensor voltage at AO (0-5V)
+ * Returns sensor voltage and estimated Rs/Ro ratio. Invalid readings are
+ * returned as NaN so they display as "--" instead of a false "Worse".
+ * @param gasVoltage output: sensor voltage at AO (0-GAS_VCC)
  * @param rsRoRatio output: Rs/Ro ratio (lower = more gas)
- * @return true always (analog read never fails)
+ * @return true if the reading is valid, false if it is out of range
  */
 bool readMQ135(float& gasVoltage, float& rsRoRatio) {
-  int adcValue = analogRead(GAS_SENSOR_PIN);
-
-  // Convert ADC to voltage at ESP32 pin (0-3.3V)
-  float vPin = (adcValue / GAS_ADC_MAX) * GAS_VREF;
+  // analogReadMilliVolts() applies the ESP32 ADC calibration, so we do not
+  // need to assume a 3.3 V full scale.
+  float vPin = analogReadMilliVolts(GAS_SENSOR_PIN) / 1000.0f;
 
   // Convert back to module AO voltage (reverse voltage divider)
   gasVoltage = vPin * GAS_DIVIDER_RATIO;
 
-  // Calculate sensor resistance Rs from voltage divider with RL
+  // Calculate sensor resistance Rs from voltage divider with RL:
   // Vout = Vcc * RL / (Rs + RL)  =>  Rs = RL * (Vcc - Vout) / Vout
-  // where Vout = gasVoltage, Vcc = 5V (module supply)
-  if (gasVoltage > 0.01) {
-    rsRoRatio = (GAS_RL * (5.0 - gasVoltage) / gasVoltage) / GAS_RO_CLEAN_AIR;
-  } else {
-    rsRoRatio = 0;
+  // where Vout = gasVoltage, Vcc = GAS_VCC (module supply).
+  if (gasVoltage <= 0.01f || gasVoltage >= GAS_VCC - 0.01f) {
+    rsRoRatio = NAN;
+    return false;
   }
 
+  float rs = GAS_RL * (GAS_VCC - gasVoltage) / gasVoltage;
+  rsRoRatio = rs / GAS_RO_CLEAN_AIR;
   return true;
 }
 
@@ -404,6 +407,29 @@ void playSequence() {
   seqPos = 0;
   playing = true;
   startStep();
+}
+
+/**
+ * @brief Stop the speaker and remember when it stopped.
+ * The timestamp is used to keep the buzzer's own 600-1000 Hz beeps from being
+ * counted as new noise by the microphone.
+ */
+void stopSpeaker(uint32_t now) {
+  ledcWriteTone(SPK_CH, 0);
+  if (playing) {
+    playing = false;
+    lastSpeakerEnd = now;
+  }
+}
+
+/**
+ * @brief True while the speaker is playing or its echo can still reach the mic.
+ */
+bool micMuted(uint32_t now) {
+  if (playing) {
+    return true;
+  }
+  return (uint32_t)(now - lastSpeakerEnd) < SPEAKER_GUARD_MS;
 }
 
 /**
@@ -439,6 +465,9 @@ void drawAlert() {
  * Uses the stored values, so it never blocks on sensor reads.
  */
 void updateDisplay() {
+  if (!displayReady) {
+    return;
+  }
   if (alertActive) {
     drawAlert();
     return;
@@ -479,11 +508,11 @@ void updateDisplay() {
 
 /**
  * @main_loop Main application loop
- * Decoupled, non-blocking scheduling:
- * - Microphone measured every MIC_INTERVAL_MS (triggers speaker on noise)
- * - DHT11 read every DHT_INTERVAL_MS
+ * Scheduling is driven by millis():
+ * - Microphone measured every MIC_INTERVAL_MS (peak + debounce drives the speaker)
+ * - DHT11 read every DHT_INTERVAL_MS, with non-blocking retries
  * - MQ135 read every GAS_INTERVAL_MS
- * The speaker sequencer is driven by millis(), no long blocking delays.
+ * The speaker sequencer is also driven by millis(), no long blocking delays.
  */
 void loop() {
   uint32_t now = millis();
@@ -492,19 +521,20 @@ void loop() {
   if (playing && now - stepStart >= seq[seqPos].ms) {
     seqPos++;
     if (seqPos >= seqLen) {
-      ledcWriteTone(SPK_CH, 0);
-      playing = false;
+      stopSpeaker(millis());
     } else {
       startStep();
     }
   }
 
-  // Microphone: max + average confirmation window (fast, drives the speaker)
+  // Microphone: 50 ms peak window + consecutive-window debounce
+  now = millis();
   if (now - lastMicRead >= MIC_INTERVAL_MS) {
     lastMicRead = now;
 
     MicWindow window = readMicWindow();
     MicDecision decision = decideMicLevel(window);
+    now = millis(); // the sampling window has advanced time
 
     micLevel   = decision.level;
     micMax     = window.maxLevel;
@@ -512,24 +542,36 @@ void loop() {
     micP2P     = window.peakToPeak;
     micVoltage = (micLevel / ADC_RESOLUTION) * VREF;
 
-    if (decision.trigger) {
+    // The buzzer's own beeps must not re-trigger the alarm, so ignore the mic
+    // while playing and briefly afterwards. Otherwise reset the debounce.
+    if (decision.aboveThreshold && !micMuted(now)) {
+      if (noiseWindowCount < MIC_TRIGGER_WINDOWS) {
+        noiseWindowCount++;
+      }
+    } else {
+      noiseWindowCount = 0;
+    }
+
+    if (noiseWindowCount >= MIC_TRIGGER_WINDOWS) {
       lastNoiseTime = now;
       alarmLatched = true;
     }
+
     alertActive = alarmLatched && (now - lastNoiseTime < ALERT_HOLD_MS);
 
     if (alertActive) {
-      if (!playing) {
+      // Leave a gap between sequences so the mic can listen to the room.
+      if (!playing && (uint32_t)(now - lastSpeakerEnd) >= BEEP_GAP_MS) {
         playSequence();
       }
     } else {
-      ledcWriteTone(SPK_CH, 0);
-      playing = false;
+      stopSpeaker(now);
       alarmLatched = false;
     }
   }
 
-  // DHT11: temperature and humidity (slow, updates the stored values)
+  // DHT11: temperature and humidity (slow, non-blocking retry scheduling)
+  now = millis();
   if (now - lastDhtRead >= DHT_INTERVAL_MS) {
     lastDhtRead = now;
 
@@ -538,34 +580,49 @@ void loop() {
       dhtHumidity = humidity;
       dhtTemperature = temperature;
       dhtValid = true;
+      dhtFailCount = 0;
     } else {
-      dhtValid = false;
+      now = millis();
+      dhtFailCount++;
+      if (dhtFailCount < MAX_READ_RETRIES) {
+        // Retry after DHT_RETRY_MS instead of blocking with delay().
+        lastDhtRead = now - (DHT_INTERVAL_MS - DHT_RETRY_MS);
+      } else {
+        // Give up for this cycle; mark invalid only after repeated failures.
+        dhtFailCount = 0;
+        dhtValid = false;
+      }
     }
   }
 
   // MQ135: gas sensor voltage and Rs/Ro ratio (updates the stored values)
+  now = millis();
   if (now - lastGasRead >= GAS_INTERVAL_MS) {
     lastGasRead = now;
     readMQ135(gasVoltage, gasRsRo);
   }
 
   // Rotate the OLED value pair every DISPLAY_SWITCH_MS (only affects normal pages)
+  now = millis();
   if (now - lastPageSwitch >= DISPLAY_SWITCH_MS) {
     lastPageSwitch = now;
     displayPage ^= 1;
   }
 
-  // Refresh the OLED often so the noise alert can flash
-  if (now - lastDisplay >= DISPLAY_REFRESH_MS) {
+  // Refresh the OLED: fast enough for the alert flash, slower for normal pages.
+  now = millis();
+  uint32_t displayRefresh = alertActive ? DISPLAY_REFRESH_ALERT_MS : DISPLAY_REFRESH_NORMAL_MS;
+  if (now - lastDisplay >= displayRefresh) {
     lastDisplay = now;
     updateDisplay();
   }
 
   // Print all values together at the same moment
+  now = millis();
   if (now - lastPrint >= PRINT_INTERVAL_MS) {
     lastPrint = now;
 
-    Serial.printf("[%lu] Mic max=%-4d avg=%-4d p-p=%-4d -> lvl=%-4d (%.2fV) %s | ",
+    Serial.printf("[%lu] Mic peak=%-4d avg=%-4d p-p=%-4d -> lvl=%-4d (%.2fV) %s | ",
                   (unsigned long)now, micMax, micAvg, micP2P, micLevel, micVoltage,
                   alertActive ? "ALERT" : "ok");
     if (dhtValid) {
@@ -573,8 +630,13 @@ void loop() {
     } else {
       Serial.printf("Hum: --    | Temp: --    | ");
     }
-    Serial.printf("Gas: %.2fV Rs/Ro: %.2f | Air: %s\n",
-                  gasVoltage, gasRsRo, airQualityLabel(gasRsRo));
+    if (isnan(gasRsRo)) {
+      Serial.printf("Gas: %.2fV Rs/Ro: -- | Air: %s\n",
+                    gasVoltage, airQualityLabel(gasRsRo));
+    } else {
+      Serial.printf("Gas: %.2fV Rs/Ro: %.2f | Air: %s\n",
+                    gasVoltage, gasRsRo, airQualityLabel(gasRsRo));
+    }
   }
 
   delay(1);
@@ -582,9 +644,11 @@ void loop() {
 
 /**
  * @todo: Calibrate NOISE_THRESHOLD for your environment.
- * Watch the printed "max / avg / p-p" values: max must stay low in silence
- * and rise clearly when shouting/blowing. If silence already exceeds the
- * threshold, the average is always computed and may keep it triggering.
+ * Watch the printed "peak / avg / p-p" values: peak must stay low in silence
+ * and rise clearly when shouting/blowing. If it is too sensitive, raise the
+ * threshold; if low-pitched sounds are missed, lower it or increase the mic
+ * gain. The longer 50 ms window and peak detector no longer penalise low
+ * frequencies, but the electret module's own frequency response remains.
  *
  * @todo: Add LED indicator on built-in GPIO2 for visual noise level.
  *
