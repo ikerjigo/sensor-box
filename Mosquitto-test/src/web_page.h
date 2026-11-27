@@ -1,0 +1,657 @@
+#pragma once
+
+// Embedded copy of webpage/index.html, served at GET /.
+// Regenerate this file if the HTML asset changes.
+static const char WEB_PAGE_HTML[] PROGMEM = R"WEBPAGE(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Dashboard</title>
+<style>
+/* ===================== CSS COMÚN =====================
+   TEMAS: cada tema es un bloque :root[data-theme="..."] con sus colores.
+   Color principal = --bg / --card (fondo)   ·   Color secundario = --accent (botones, detalles)
+   Para añadir un tema: copia un bloque, cambia el nombre y los colores, y añade un <option>
+   con ese mismo nombre en el <select id="themeSelect"> de la cabecera. */
+:root {                      /* Tema por defecto: blanco + azul */
+    color-scheme: light;
+    --bg: #f3f5f8;
+    --card: #ffffff;
+    --text: #202633;
+    --muted: #687386;
+    --border: #dce1e8;
+    --accent: #3768e8;
+    --accent-soft: #e8eefc;
+    --on-accent: #ffffff;    /* color del texto sobre --accent */
+    --input: #ffffff;
+    --ok: #1f9d55;
+    --warn: #d98a00;
+    --bad: #bd3030;
+}
+:root[data-theme="white-red"] {
+    --bg: #f7f3f3; --card: #ffffff; --text: #2a2022; --muted: #7a6a6d;
+    --border: #e6dcdc; --accent: #d62e3b; --accent-soft: #fdeaec; --on-accent: #ffffff; --input: #ffffff;
+}
+:root[data-theme="white-green"] {
+    --bg: #f2f6f3; --card: #ffffff; --text: #1f2a24; --muted: #66756b;
+    --border: #d8e3da; --accent: #178a4a; --accent-soft: #e3f4ea; --on-accent: #ffffff; --input: #ffffff;
+}
+:root[data-theme="gray-sky"] {
+    --bg: #d5dae0; --card: #e8ebef; --text: #1f262e; --muted: #56606c;
+    --border: #bcc4cd; --accent: #0ea5e9; --accent-soft: #cfe9f6; --on-accent: #04202e; --input: #f3f5f7;
+}
+/* Los temas oscuros comparten esta base y luego cambian el color secundario */
+:root[data-theme^="dark"] {
+    color-scheme: dark;
+    --bg: #11151c; --card: #1b222d; --text: #e8edf5; --muted: #a1adbf;
+    --border: #343e4d; --accent: #7094ff; --accent-soft: #232d44; --on-accent: #0b1530; --input: #151b24;
+    --ok: #4cc27f; --warn: #f0b429; --bad: #e05a5a;
+}
+:root[data-theme="dark-red"] {
+    --bg: #1b1416; --card: #261b1e; --text: #f3e8ea; --muted: #b9a3a8;
+    --border: #44313a; --accent: #ff5a64; --accent-soft: #3a2025; --on-accent: #2a0508; --input: #1f1518;
+}
+:root[data-theme="dark-green"] {
+    --bg: #121a16; --card: #1b2621; --text: #e6f1ea; --muted: #9db3a5;
+    --border: #2f4238; --accent: #4cc27f; --accent-soft: #1f3a2b; --on-accent: #06210f; --input: #16201b;
+}
+
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    padding: 24px 14px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, sans-serif;
+}
+main { max-width: 650px; margin: auto; }
+header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 22px;
+}
+h1 { font-size: 1.55rem; margin: 0; }
+h2 { font-size: 1.1rem; margin: 0 0 14px; }
+p { line-height: 1.5; }
+.card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px;
+    margin-bottom: 16px;
+}
+.muted { color: var(--muted); }
+label { display: block; margin: 15px 0 7px; font-weight: 600; }
+input, select, button {
+    width: 100%;
+    padding: 12px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: var(--input);
+    color: var(--text);
+    font: inherit;
+}
+input:focus-visible, select:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+button {
+    background: var(--accent);
+    color: var(--on-accent);
+    border: none;
+    cursor: pointer;
+    margin-top: 14px;
+    font-weight: 600;
+}
+button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+button.danger { background: var(--bad); color: #fff; }
+button:disabled { opacity: .55; cursor: wait; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+.stat { padding: 13px; border: 1px solid var(--border); border-radius: 10px; min-width: 0; }
+.stat .value { font-size: 1.05rem; font-weight: 650; overflow-wrap: anywhere; margin-top: 6px; }
+.status { font-weight: 650; }
+a { color: var(--accent); }
+
+/* Casillas de sensores: una fila por sensor -> [emoji grande] [título] ............ [valor grande].
+   Todas las filas tienen la misma altura; la etiqueta larga usa una fuente menor. */
+.sensor-grid { display: grid; grid-template-columns: 1fr; grid-auto-rows: 1fr; gap: 10px; }
+.sensor {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 16px;
+    background: var(--accent-soft);
+    border-color: transparent;
+    min-height: 88px;
+    height: 100%;
+}
+.sensor .icon {
+    flex: none;
+    width: 60px;
+    height: 60px;
+    display: grid;
+    place-items: center;
+    font-size: 2rem;
+    background: var(--card);
+    border-radius: 16px;
+}
+.sensor .name {
+    flex: 1;
+    min-width: 0;
+    font-size: clamp(1rem, 4vw, 1.35rem);
+    font-weight: 700;
+    line-height: 1.2;
+}
+.sensor .name.small { font-size: clamp(.9rem, 3.4vw, 1.15rem); }
+.sensor .value {
+    flex: none;
+    margin: 0 0 0 auto;
+    text-align: right;
+    font-size: clamp(1.8rem, 8vw, 2.4rem);
+    font-weight: 700;
+    line-height: 1.1;
+}
+.sensor.empty .value { color: var(--muted); }
+
+/* Solo configuración Wi-Fi */
+.status-box {
+    margin-top: 18px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: var(--accent-soft);
+    border-left: 4px solid var(--accent);
+}
+.status-box.ok   { border-left-color: var(--ok); }
+.status-box.fail { border-left-color: var(--bad); }
+.status-box p { margin: 0; }
+
+/* ===================== TABS (manila-folder style) ===================== */
+.tabs {
+    display: flex;
+    gap: 4px;
+    margin: 8px 0 16px;
+    border-bottom: 2px solid var(--border);
+}
+.tabs button {
+    flex: 1;
+    max-width: 180px;
+    padding: 12px 16px;
+    margin: 0;
+    border: 2px solid var(--border);
+    border-bottom: none;
+    border-radius: 10px 10px 0 0;
+    background: var(--bg);
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: background .15s, color .15s, border-color .15s;
+    z-index: 1;
+    position: relative;
+    bottom: -2px; /* overlap the border */
+}
+.tabs button:hover { color: var(--text); background: var(--card); }
+.tabs button[aria-selected="true"] {
+    background: var(--card);
+    color: var(--accent);
+    border-color: var(--border);
+    border-bottom-color: var(--card); /* visually connects to panel */
+}
+.tab-panel { display: none; }
+.tab-panel.active { display: block; animation: fadeIn .15s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+</style>
+<script>
+/* Tema: se aplica antes de pintar la página (sin parpadeo) y se recuerda entre visitas. */
+const THEMES = ['white-blue', 'white-red', 'white-green', 'gray-sky',
+                'dark-blue', 'dark-red', 'dark-green'];
+(function () {
+    const legacy = {light: 'white-blue', dark: 'dark-blue'};   // valores de la versión anterior
+    let t = 'white-blue';
+    try { t = localStorage.getItem('esp32-theme') || t; } catch (e) {}
+    t = legacy[t] || t;
+    if (!THEMES.includes(t)) t = 'white-blue';
+    document.documentElement.dataset.theme = t;
+})();
+function setTheme(t) {
+    document.documentElement.dataset.theme = t;
+    try { localStorage.setItem('esp32-theme', t); } catch (e) {}
+}
+document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('themeSelect').value = document.documentElement.dataset.theme;
+});
+</script>
+</head>
+<body>
+<main>
+<header>
+    <h1>ESP32 Dashboard</h1>
+    <select id="themeSelect" aria-label="Tema" onchange="setTheme(this.value)"
+        style="width:auto;margin:0">
+        <option value="white-blue">Blanc i blau</option>
+        <option value="white-red">Blanc i vermell</option>
+        <option value="white-green">Blanc i verd</option>
+        <option value="gray-sky">Gris i blau cel</option>
+        <option value="dark-blue">Fosc i blau</option>
+        <option value="dark-red">Fosc i vermell</option>
+        <option value="dark-green">Fosc i verd</option>
+    </select>
+</header>
+
+<!-- ============ TAB NAVIGATION ============ -->
+<div class="tabs" role="tablist" aria-label="Dashboard sections">
+    <button role="tab" id="tab-data" class="active" aria-selected="true"
+        aria-controls="panel-data" onclick="switchTab('data')">Data</button>
+    <button role="tab" id="tab-network" aria-selected="false"
+        aria-controls="panel-network" onclick="switchTab('network')">Network</button>
+</div>
+
+<!-- ============ DATA TAB PANEL ============ -->
+<div id="panel-data" class="tab-panel active" role="tabpanel" aria-labelledby="tab-data">
+
+<!-- ============ SENSORES Y DASHBOARD ============ -->
+<!--
+  IDs para el firmware / el compañero (el <span> contiene SOLO el número, sin unidades):
+    temperature  -> Temperatura
+    humidity     -> Humitat
+    noise        -> Soroll
+    chemicals    -> Químics
+    airQuality   -> Qualitat d'aire
+  Desde JS: setSensor('temperature', 23.5)  ó  setSensors({temperature: 23.5, ...})
+  La página pide los valores a GET /sensors cada 3 s (ver script).
+  Este bloque se ve con y sin Wi-Fi. La tarjeta "Qualitat d'aire" usa una
+  fuente menor para que todas las filas queden exactamente igual de altas.
+-->
+
+<!-- ============ SENSORES Y DASHBOARD ============ -->
+<!--
+  IDs para el firmware / el compañero (el <span> contiene SOLO el número, sin unidades):
+    temperature  -> Temperatura
+    humidity     -> Humitat
+    noise        -> Soroll
+    chemicals    -> Químics
+    airQuality   -> Qualitat d'aire
+  Desde JS: setSensor('temperature', 23.5)  ó  setSensors({temperature: 23.5, ...})
+  La página pide los valores a GET /sensors cada 3 s (ver script).
+  Este bloque se ve con y sin Wi-Fi. La tarjeta "Qualitat d'aire" usa una
+  fuente menor para que todas las filas queden exactamente igual de altas.
+-->
+<section class="card">
+    <h2>Sensors</h2>
+    <div class="sensor-grid">
+        <div class="stat sensor empty" id="card-temperature">
+            <div class="icon">🌡️</div>
+            <div class="name">Temperatura</div>
+            <div class="value"><span id="temperature">--</span></div>
+        </div>
+        <div class="stat sensor empty" id="card-humidity">
+            <div class="icon">💧</div>
+            <div class="name">Humitat</div>
+            <div class="value"><span id="humidity">--</span></div>
+        </div>
+        <div class="stat sensor empty" id="card-noise">
+            <div class="icon">🔊</div>
+            <div class="name">Soroll</div>
+            <div class="value"><span id="noise">--</span></div>
+        </div>
+        <div class="stat sensor empty" id="card-airQuality">
+            <div class="icon">🍃</div>
+            <div class="name small">Qualitat d'aire</div>
+            <div class="value"><span id="airQuality">--</span></div>
+        </div>
+    </div>
+</section>
+
+<section class="card">
+    <h2>Hardware</h2>
+    <div class="grid">
+        <div class="stat"><div class="muted">Chip</div><div class="value" id="chip">-</div></div>
+        <div class="stat"><div class="muted">CPU frequency</div><div class="value" id="cpu">-</div></div>
+        <div class="stat"><div class="muted">Flash size</div><div class="value" id="flash">-</div></div>
+        <div class="stat"><div class="muted">PSRAM size</div><div class="value" id="psram">-</div></div>
+    </div>
+</section>
+
+<section class="card">
+    <h2>System</h2>
+    <div class="grid">
+        <div class="stat"><div class="muted">Uptime</div><div class="value" id="uptime">-</div></div>
+        <div class="stat"><div class="muted">Free heap</div><div class="value" id="heap">-</div></div>
+        <div class="stat"><div class="muted">Free PSRAM</div><div class="value" id="freePsram">-</div></div>
+    </div>
+</section>
+
+</div> <!-- end panel-data -->
+
+<!-- ============ NETWORK TAB PANEL ============ -->
+<div id="panel-network" class="tab-panel" role="tabpanel" aria-labelledby="tab-network">
+
+<!-- ============ CONFIGURACIÓN WI-FI ============ -->
+<section class="card" id="wifiCard">
+    <h2>Wi-Fi configuration</h2>
+    <p class="muted">
+        Select your network and enter its password.
+        The setup access point will shut down after a successful connection.
+    </p>
+
+    <form id="wifiForm">
+        <label for="ssidSelect">Wi-Fi network</label>
+        <select id="ssidSelect" name="ssid" required>
+            <option value="">Scan for networks</option>
+        </select>
+
+        <button type="button" class="secondary" onclick="scanNetworks()">Scan networks</button>
+
+        <label for="password">Wi-Fi password</label>
+        <input id="password" name="password" type="password"
+            autocomplete="current-password" placeholder="Enter password">
+
+        <button id="connectButton" type="submit">Connect</button>
+    </form>
+
+    <div id="statusBox" class="status-box">
+        <p id="status" class="status">Setup access point active</p>
+    </div>
+    <p class="muted">
+        If the connection succeeds, find the ESP32's IP address
+        in your router or the serial monitor.
+    </p>
+</section>
+
+<!-- ============ NETWORK STATUS (shown when connected) ============ -->
+<section class="card" id="networkStatusCard" style="display:none;">
+    <h2>Network status</h2>
+    <div class="grid">
+        <div class="stat"><div class="muted">Status</div><div class="value" id="wifiStatus">Connected</div></div>
+        <div class="stat"><div class="muted">SSID</div><div class="value" id="ssid">-</div></div>
+        <div class="stat"><div class="muted">IP address</div><div class="value" id="ip">-</div></div>
+        <div class="stat"><div class="muted">Signal strength</div><div class="value" id="rssi">-</div></div>
+        <div class="stat"><div class="muted">MAC address</div><div class="value" id="mac">-</div></div>
+    </div>
+    <p class="muted" style="margin-top:16px;">
+        Forgetting the saved network erases the stored credentials
+        and restarts the ESP32 in setup mode.
+    </p>
+    <button type="button" class="danger" onclick="forgetWiFi()">Forget Wi-Fi</button>
+</section>
+
+<script>
+/* ---- MODO DEMO: solo si abres el archivo directamente en el navegador (file://).
+        En el ESP32 se usan los endpoints reales:
+        /networks, /connect, /status, /info, /sensors y /forget. ---- */
+const DEMO = location.protocol === 'file:';
+let demoConnected = true;   // la demo arranca conectada para ver el dashboard lleno
+let demoPolls = 0;
+
+async function api(path, options) {
+    if (DEMO) {
+        await new Promise(r => setTimeout(r, 350));
+        if (path === '/networks') return [
+            {ssid: 'Casa_WiFi', rssi: -48}, {ssid: 'Vecino_2.4G', rssi: -71},
+            {ssid: 'Cafeteria', rssi: -83}];
+        if (path === '/connect') { demoPolls = 0; demoConnected = false; return {ok: true}; }
+        if (path === '/status') {
+            if (!demoConnected) {
+                demoPolls++;
+                if (demoPolls >= 3) demoConnected = true;
+            }
+            return demoConnected
+                ? {state: 'connected', ssid: 'Casa_WiFi', ip: '192.168.1.50'}
+                : {state: demoPolls ? 'connecting' : 'idle', ssid: '', ip: ''};
+        }
+        if (path === '/info') return {
+            status: demoConnected ? 'Connected' : 'Disconnected',
+            ssid: demoConnected ? 'Casa_WiFi' : '', ip: demoConnected ? '192.168.1.50' : '0.0.0.0',
+            rssi: demoConnected ? -52 : 0, mac: 'AA:BB:CC:DD:EE:FF', chip: 'ESP32-S3', cpu: 240,
+            flash: 8388608, psram: 8388608, uptime: '0d, 00:12:34',
+            heap: 210000, freePsram: 8000000};
+        if (path === '/sensors') return {
+            temperature: 20 + Math.random() * 6, humidity: 40 + Math.random() * 20,
+            noise: 35 + Math.random() * 25, chemicals: Math.random() * 5,
+            airQuality: 20 + Math.random() * 60};
+        if (path === '/forget') { demoConnected = false; demoPolls = 0; return {ok: true}; }
+    }
+    const response = await fetch(path, options);
+    return response.json();
+}
+
+/* ---- Elementos de la configuración Wi-Fi ---- */
+const statusEl = document.getElementById('status');
+const statusBox = document.getElementById('statusBox');
+const connectButton = document.getElementById('connectButton');
+const ssidSelect = document.getElementById('ssidSelect');
+
+function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusBox.className = 'status-box' + (kind ? ' ' + kind : '');
+}
+
+/* Toggle between Wi-Fi config (when disconnected) and network status (when connected). */
+function showNetworkView(connected) {
+    const configCard = document.getElementById('wifiCard');
+    const statusCard = document.getElementById('networkStatusCard');
+    if (configCard) configCard.style.display = connected ? 'none' : '';
+    if (statusCard) statusCard.style.display = connected ? '' : 'none';
+}
+
+/* Tab switching */
+function switchTab(name) {
+    const dataTab = document.getElementById('tab-data');
+    const networkTab = document.getElementById('tab-network');
+    const dataPanel = document.getElementById('panel-data');
+    const networkPanel = document.getElementById('panel-network');
+
+    if (name === 'data') {
+        dataTab.classList.add('active'); dataTab.setAttribute('aria-selected', 'true');
+        networkTab.classList.remove('active'); networkTab.setAttribute('aria-selected', 'false');
+        dataPanel.classList.add('active'); networkPanel.classList.remove('active');
+    } else {
+        networkTab.classList.add('active'); networkTab.setAttribute('aria-selected', 'true');
+        dataTab.classList.remove('active'); dataTab.setAttribute('aria-selected', 'false');
+        networkPanel.classList.add('active'); dataPanel.classList.remove('active');
+    }
+}
+
+async function scanNetworks() {
+    setStatus('Scanning for networks...');
+    try {
+        const networks = await api('/networks');
+        ssidSelect.innerHTML = '';
+        if (!networks.length) ssidSelect.add(new Option('No networks found', ''));
+        networks.forEach(n => ssidSelect.add(new Option(n.ssid + ' (' + n.rssi + ' dBm)', n.ssid)));
+        setStatus('Network scan complete.');
+    } catch (error) {
+        setStatus('Could not scan for networks.', 'fail');
+    }
+}
+
+let statusPolling = false;
+
+async function pollStatus() {
+    if (statusPolling) return;
+    statusPolling = true;
+    try {
+        const result = await api('/status');
+        if (result.state === 'connected') {
+            setStatus('Connected. IP address: ' + result.ip +
+                '. Open this address after the setup network closes.', 'ok');
+            connectButton.disabled = false;
+            statusPolling = false;
+            showNetworkView(true);
+            refreshInfo();
+            return;
+        }
+        if (result.state === 'failed') {
+            setStatus('Connection failed. Check your password and try again.', 'fail');
+            connectButton.disabled = false;
+            statusPolling = false;
+            return;
+        }
+        setStatus('Connecting to Wi-Fi...');
+        setTimeout(function () { statusPolling = false; pollStatus(); }, 1500);
+    } catch (error) {
+        setStatus('Connection status unavailable. Check the serial monitor.', 'fail');
+        connectButton.disabled = false;
+        statusPolling = false;
+    }
+}
+
+/* Estado inicial: si ya hay Wi-Fi, lo mostramos; si no, escaneamos redes. */
+async function refreshStatus() {
+    try {
+        const result = await api('/status');
+        if (result.state === 'connected') {
+            setStatus('Connected to ' + (result.ssid || 'Wi-Fi') +
+                (result.ip ? ' · ' + result.ip : ''), 'ok');
+        } else if (result.state === 'connecting') {
+            setStatus('Connecting to Wi-Fi...');
+            connectButton.disabled = true;
+            pollStatus();
+        } else if (result.state === 'failed') {
+            setStatus('Connection failed. Check your password and try again.', 'fail');
+        } else {
+            setStatus('Setup access point active. Select a network below.');
+        }
+        showNetworkView(result.state === 'connected');
+        return result.state;
+    } catch (error) {
+        setStatus('Connection status unavailable. Check the serial monitor.', 'fail');
+        return 'unknown';
+    }
+}
+
+document.getElementById('wifiForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const ssid = ssidSelect.value;
+    const password = document.getElementById('password').value;
+
+    if (!ssid) { setStatus('Select a Wi-Fi network first.', 'fail'); return; }
+
+    connectButton.disabled = true;
+    setStatus('Connecting...');
+
+    try {
+        const body = new URLSearchParams();
+        body.set('ssid', ssid);
+        body.set('password', password);
+
+        const result = await api('/connect', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body
+        });
+
+        if (!result.ok) {
+            setStatus(result.message || 'Could not start connection.', 'fail');
+            connectButton.disabled = false;
+            return;
+        }
+        pollStatus();
+    } catch (error) {
+        setStatus('Connection request failed.', 'fail');
+        connectButton.disabled = false;
+    }
+});
+
+/* ---- Utilidades del dashboard ---- */
+function setText(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+}
+
+function bytes(value) {
+    if (!value) return '0 MB';
+    return (value / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+/* ---- API de sensores (para el compañero) ----
+   setSensor('humidity', 52.3)  -> escribe el valor en <span id="humidity">
+   Un valor null/undefined deja "--".                                      */
+function setSensor(id, value, decimals = 1, unit = '') {
+    const el = document.getElementById(id);
+    const card = document.getElementById('card-' + id);
+    const valid = typeof value === 'number' && isFinite(value);
+    el.textContent = valid ? value.toFixed(decimals) + unit : '--';
+    if (card) card.classList.toggle('empty', !valid);
+}
+
+function setSensors(d) {
+    setSensor('temperature', d.temperature, 1, ' °C');
+    setSensor('humidity',    d.humidity,    1, ' %');
+    setSensor('noise',       d.noise,       0, ' dB');
+    // airQuality is now a string label: "Great"/"Good"/"Bad"/"Worse"
+    const aqEl = document.getElementById('airQuality');
+    const aqCard = document.getElementById('card-airQuality');
+    const valid = typeof d.airQuality === 'string' && d.airQuality !== '--';
+    aqEl.textContent = valid ? d.airQuality : '--';
+    if (aqCard) aqCard.classList.toggle('empty', !valid);
+}
+
+async function refreshSensors() {
+    try {
+        setSensors(await api('/sensors'));
+    } catch (error) {
+        /* Si /sensors aún no existe en el firmware, las casillas se quedan en "--" */
+        setSensors({});
+    }
+}
+
+async function refreshInfo() {
+    try {
+        const d = await api('/info');
+        const online = d.status === 'Connected';
+
+        showNetworkView(online);
+
+        setText('wifiStatus', d.status || 'Unavailable');
+        setText('ssid', online ? (d.ssid || '-') : '-');
+        setText('ip', online ? (d.ip || '-') : '-');
+        setText('rssi', online ? d.rssi + ' dBm' : '-');
+        setText('mac', d.mac || '-');
+        setText('chip', d.chip || '-');
+        setText('cpu', d.cpu ? d.cpu + ' MHz' : '-');
+        setText('flash', bytes(d.flash));
+        setText('psram', bytes(d.psram));
+        setText('uptime', d.uptime || '-');
+        setText('heap', bytes(d.heap));
+        setText('freePsram', bytes(d.freePsram));
+    } catch (error) {
+        setText('wifiStatus', 'Unavailable');
+    }
+}
+
+async function forgetWiFi() {
+    if (!confirm('Forget the saved Wi-Fi network and restart?')) return;
+
+    try {
+        await api('/forget', {method: 'POST'});
+        document.body.innerHTML =
+            '<main><h1>Restarting...</h1>' +
+            '<p>Reconnect to ESP32-Setup and open http://192.168.4.1</p></main>';
+    } catch (error) {
+        document.body.innerHTML =
+            '<main><h1>Restarting...</h1>' +
+            '<p>Reconnect to the ESP32 setup network.</p></main>';
+    }
+}
+
+/* ---- Arranque de la página ---- */
+(async function init() {
+    const state = await refreshStatus();
+    if (state !== 'connected') scanNetworks();
+    refreshInfo();
+    refreshSensors();
+    setInterval(refreshInfo, 3000);
+    setInterval(refreshSensors, 3000);
+    setInterval(refreshStatus, 10000);
+})();
+</script>
+
+<p class="muted" style="text-align:center;font-size:.85rem">ESP32-S3 · Local web interface</p>
+</main>
+</body>
+</html>
+)WEBPAGE";
