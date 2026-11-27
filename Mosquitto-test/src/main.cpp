@@ -19,6 +19,7 @@
 #include <DHT.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <WiFi.h>
 #include "web_portal.h"
 
 /** Pin definitions */
@@ -447,14 +448,20 @@ void updateDisplay() {
     return;
   }
 
-  display.invertDisplay(false);  // Make sure the alert's invert is cleared
+  display.invertDisplay(false);
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  // Small header showing which pair is on screen
+  // Small header with page title + WiFi status (top-right)
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print(displayPage == 0 ? "MIC + AIR" : "TEMP + HUM");
+  const char* wifiStr = (WiFi.status() == WL_CONNECTED) ? "WiFi OK" : "No WiFi";
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(wifiStr, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor(SCREEN_WIDTH - w, 0);
+  display.print(wifiStr);
 
   // Two large values
   display.setTextSize(2);
